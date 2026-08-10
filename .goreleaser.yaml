@@ -52,9 +52,12 @@ changelog:
       - "^test:"
       - "^chore:"
 
-brews:
+homebrew_casks:
   - name: stoa
     ids:
+      - stoa
+    # The binary(ies) inside the archive to link onto the PATH.
+    binaries:
       - stoa
     repository:
       owner: jamescalam
@@ -62,8 +65,10 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/jamescalam/stoa"
     description: "Minimal in-terminal music radio with a Greco-Roman visualizer"
-    license: "MIT"
-    install: |
-      bin.install "stoa"
-    test: |
-      system "#{bin}/stoa", "--version"
+    # The binary is unsigned, so strip the Gatekeeper quarantine flag on install
+    # (casks have no default for this) — otherwise the first run is blocked as
+    # coming from an "unidentified developer".
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/stoa"]
