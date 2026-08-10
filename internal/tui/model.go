@@ -40,6 +40,7 @@ var (
 	progFill    = lipgloss.NewStyle().Foreground(terracota)
 	progKnob    = lipgloss.NewStyle().Foreground(ivory)
 	progEmpty   = lipgloss.NewStyle().Foreground(dim)
+	liveStyle   = lipgloss.NewStyle().Foreground(terracota).Bold(true)
 	volFull     = lipgloss.NewStyle().Foreground(terracota)
 	volEmpty    = lipgloss.NewStyle().Foreground(dim)
 	volCapStyle = lipgloss.NewStyle().Foreground(dim)
@@ -188,8 +189,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) play() {
-	if len(m.stations) > 0 {
-		m.player.Play(m.stations[m.sel])
+	if len(m.stations) == 0 {
+		return
+	}
+	s := m.stations[m.sel]
+	if s.IsStream() {
+		m.player.PlayStream(s.Name, s.Stream)
+	} else {
+		m.player.Play(s)
 	}
 }
 
@@ -278,7 +285,11 @@ func (m Model) trackInfo() string {
 	if m.hasNow {
 		title = m.now.Track.Title
 		artist = m.now.Track.Artist
-		sub = fmt.Sprintf("%s · %d/%d", m.now.Station, m.now.Index, m.now.Total)
+		if m.now.Live {
+			sub = "live radio"
+		} else {
+			sub = fmt.Sprintf("%s · %d/%d", m.now.Station, m.now.Index, m.now.Total)
+		}
 	}
 	col := lipgloss.NewStyle().Width(leftColWidth)
 	return col.Render(lipgloss.JoinVertical(lipgloss.Left,
@@ -296,6 +307,13 @@ func (m Model) controlsAndProgress(width int) string {
 	}
 	controls := btnStyle.Render("⏮") + "   " + ppStyle.Render(pp) + "   " + btnStyle.Render("⏭")
 	controlsRow := lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(controls)
+
+	// Live streams have no duration or seek — show an on-air indicator instead.
+	if m.hasNow && m.now.Live {
+		line := liveStyle.Render("◉ LIVE") + timeStyle.Render("   "+fmtDur(m.elapsed)+" on air")
+		liveRow := lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(line)
+		return lipgloss.JoinVertical(lipgloss.Center, controlsRow, liveRow)
+	}
 
 	el := fmtDur(m.elapsed)
 	tot := fmtDur(m.total)

@@ -4,9 +4,16 @@
 package player
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
+	"net/http"
+	neturl "net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,6 +38,7 @@ type Event struct {
 	Total    int
 	Duration time.Duration
 	Playing  bool
+	Live     bool // a live internet-radio stream (no duration/seek)
 	Err      error
 }
 
@@ -75,7 +83,14 @@ type Player struct {
 	trackTotal time.Duration   // full length of the current track
 	volLevel   int             // 0..maxVol
 	paused     bool
+	live       bool               // current source is a live stream
+	streamHost string             // display host for the live stream (e.g. stream.nightride.fm)
+	streamStop context.CancelFunc // cancels the current stream's HTTP request
+	liveKey    string             // metadata station key for the current stream
+	liveTitle  string             // current track title from stream metadata
+	liveArtist string             // current track artist from stream metadata
 
+	http   *http.Client
 	cmds   chan command
 	events chan Event
 }
@@ -89,6 +104,7 @@ func New() (*Player, error) {
 	p := &Player{
 		sr:       sr,
 		volLevel: defaultVol,
+		http:     &http.Client{}, // no timeout: streams are open-ended
 		cmds:     make(chan command, 8),
 		events:   make(chan Event, 8),
 	}
@@ -101,6 +117,7 @@ func (p *Player) Events() <-chan Event { return p.events }
 
 // Play starts a station from the top of its (possibly shuffled) order.
 func (p *Player) Play(s station.Station) {
+	p.stopStream() // leave any live stream first
 	p.mu.Lock()
 	p.stationName = s.Name
 	p.tracks = s.Tracks
@@ -115,6 +132,199 @@ func (p *Player) Play(s station.Station) {
 	}
 	p.playAt(p.order[0])
 }
+
+// PlayStream tunes into a live internet-radio stream (an endless MP3 stream).
+func (p *Player) PlayStream(name, url string) {
+	p.stopStream()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		p.emitErr(err)
+		return
+	}
+	req.Header.Set("User-Agent", "stoa")
+	host := url
+	if u, e := neturl.Parse(url); e == nil && u.Host != "" {
+		host = u.Host
+	}
+	sseURL, metaKey, hasMeta := metadataSourceFor(url)
+	// Deliberately no "Icy-MetaData" header: we want a clean MP3 body, not one
+	// with interleaved metadata that would corrupt decoding.
+	resp, err := p.http.Do(req)
+	if err != nil {
+		cancel()
+		p.emitErr(fmt.Errorf("%s: %w", name, err))
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		resp.Body.Close()
+		p.emitErr(fmt.Errorf("%s: %s", name, resp.Status))
+		return
+	}
+
+	// Buffer the network read to absorb jitter, and keep Close wired to the body.
+	rc := &bufReadCloser{Reader: bufio.NewReaderSize(resp.Body, 256<<10), closer: resp.Body}
+	streamer, format, err := mp3.Decode(rc)
+	if err != nil {
+		cancel()
+		resp.Body.Close()
+		p.emitErr(fmt.Errorf("%s: %w", name, err))
+		return
+	}
+
+	p.mu.Lock()
+	g, silent := gainFor(p.volLevel)
+	p.mu.Unlock()
+
+	var s beep.Streamer = streamer
+	if format.SampleRate != p.sr {
+		s = beep.Resample(4, format.SampleRate, p.sr, streamer)
+	}
+	ctrl := &beep.Ctrl{Streamer: s}
+	vol := &effects.Volume{Streamer: ctrl, Base: 2, Volume: g, Silent: silent}
+
+	speaker.Clear()
+
+	p.mu.Lock()
+	if p.stream != nil {
+		p.stream.Close()
+	}
+	p.ctrl, p.vol, p.stream = ctrl, vol, streamer
+	p.trackSR = format.SampleRate
+	p.trackTotal = 0
+	p.paused = false
+	p.stationName = name
+	p.streamHost = host
+	p.liveKey, p.liveTitle, p.liveArtist = metaKey, "", ""
+	p.tracks, p.order, p.pos = nil, nil, 0 // no track list; next/prev become no-ops
+	p.live = true
+	p.streamStop = cancel
+	p.mu.Unlock()
+
+	speaker.Play(vol) // endless: no Seq/Callback
+	p.emitLive()
+
+	if hasMeta {
+		go p.pollMetadata(ctx, sseURL, metaKey)
+	}
+}
+
+// metadataSourceFor returns the SSE metadata endpoint and station key for a
+// stream URL, if one is known. Currently only Nightride FM is supported.
+func metadataSourceFor(streamURL string) (sseURL, key string, ok bool) {
+	u, err := neturl.Parse(streamURL)
+	if err != nil {
+		return "", "", false
+	}
+	if strings.Contains(u.Host, "nightride.fm") {
+		return "https://nightride.fm/meta", strings.TrimSuffix(path.Base(u.Path), ".mp3"), true
+	}
+	return "", "", false
+}
+
+// pollMetadata keeps an SSE connection to the metadata endpoint open, updating
+// now-playing whenever the current station's track changes. It reconnects until
+// the stream's context is cancelled.
+func (p *Player) pollMetadata(ctx context.Context, sseURL, key string) {
+	for ctx.Err() == nil {
+		p.readMeta(ctx, sseURL, key)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second): // brief backoff, then reconnect
+		}
+	}
+}
+
+func (p *Player) readMeta(ctx context.Context, sseURL, key string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("User-Agent", "stoa")
+	resp, err := p.http.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	var data strings.Builder
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" { // blank line terminates an SSE event
+			if data.Len() > 0 {
+				p.handleMeta(data.String(), key)
+				data.Reset()
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "data:"); ok {
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
+			data.WriteString(strings.TrimSpace(v))
+		}
+	}
+}
+
+func (p *Player) handleMeta(data, key string) {
+	if data == "keepalive" {
+		return
+	}
+	var items []struct {
+		Station string `json:"station"`
+		Title   string `json:"title"`
+		Artist  string `json:"artist"`
+	}
+	if err := json.Unmarshal([]byte(data), &items); err != nil || len(items) == 0 {
+		return
+	}
+	it := items[0]
+	if it.Station != key {
+		return
+	}
+	p.mu.Lock()
+	// Ignore if we've since switched away from this stream.
+	if !p.live || p.liveKey != key {
+		p.mu.Unlock()
+		return
+	}
+	changed := it.Title != p.liveTitle || it.Artist != p.liveArtist
+	p.liveTitle, p.liveArtist = it.Title, it.Artist
+	p.mu.Unlock()
+	if changed {
+		p.emitLive()
+	}
+}
+
+// stopStream cancels any active live stream's HTTP request.
+func (p *Player) stopStream() {
+	p.mu.Lock()
+	cancel := p.streamStop
+	p.streamStop = nil
+	p.live = false
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// bufReadCloser adds buffering to a stream while closing the underlying body.
+type bufReadCloser struct {
+	*bufio.Reader
+	closer io.Closer
+}
+
+func (b *bufReadCloser) Close() error { return b.closer.Close() }
 
 // Next skips to the following track.
 func (p *Player) Next() {
@@ -144,7 +354,7 @@ func (p *Player) TogglePause() {
 	p.paused = p.ctrl.Paused
 	speaker.Unlock()
 	p.mu.Unlock()
-	p.emit()
+	p.emitCurrent()
 }
 
 // SetPaused forces the paused state (used by OS media commands where play and
@@ -160,7 +370,7 @@ func (p *Player) SetPaused(paused bool) {
 	p.paused = paused
 	speaker.Unlock()
 	p.mu.Unlock()
-	p.emit()
+	p.emitCurrent()
 }
 
 // AdjustVolume changes the volume by delta steps, clamped to [0, maxVol].
@@ -206,6 +416,7 @@ func (p *Player) Progress() (elapsed time.Duration, ok bool) {
 
 // Close stops playback and releases the speaker.
 func (p *Player) Close() {
+	p.stopStream()
 	speaker.Clear()
 	p.mu.Lock()
 	if p.stream != nil {
@@ -317,6 +528,36 @@ func (p *Player) emit() {
 		Total:    len(p.tracks),
 		Duration: p.trackTotal,
 		Playing:  !p.paused,
+	}
+	p.mu.Unlock()
+	p.send(ev)
+}
+
+// emitCurrent emits the right event shape for the current source.
+func (p *Player) emitCurrent() {
+	p.mu.Lock()
+	live := p.live
+	p.mu.Unlock()
+	if live {
+		p.emitLive()
+	} else {
+		p.emit()
+	}
+}
+
+// emitLive emits now-playing state for a live stream. It shows the current
+// track from stream metadata once known, falling back to the station name.
+func (p *Player) emitLive() {
+	p.mu.Lock()
+	title, artist := p.stationName, p.streamHost
+	if p.liveTitle != "" {
+		title, artist = p.liveTitle, p.liveArtist
+	}
+	ev := Event{
+		Station: p.stationName,
+		Track:   station.Track{Title: title, Artist: artist},
+		Live:    true,
+		Playing: !p.paused,
 	}
 	p.mu.Unlock()
 	p.send(ev)

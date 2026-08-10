@@ -23,7 +23,8 @@ type Track struct {
 	Source  string `yaml:"source"`
 }
 
-// Station is one entry in the picker.
+// Station is one entry in the picker. It is either a local station (Tracks or
+// a Source folder) or a live internet-radio station (Stream URL).
 type Station struct {
 	Numeral     string  `yaml:"numeral"`
 	Name        string  `yaml:"name"`
@@ -32,7 +33,11 @@ type Station struct {
 	Scene       string  `yaml:"scene"`
 	Source      string  `yaml:"source"` // optional folder (bring-your-own)
 	Tracks      []Track `yaml:"tracks"`
+	Stream      string  `yaml:"stream"` // live radio stream URL (mutually exclusive with tracks)
 }
+
+// IsStream reports whether this station is a live internet-radio stream.
+func (s Station) IsStream() bool { return s.Stream != "" }
 
 var audioExts = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".ogg": true}
 
@@ -83,6 +88,9 @@ func load(path string) (Station, error) {
 // resolve turns a folder source into explicit tracks and makes every track
 // path absolute (relative paths are taken from audioDir; ~ is expanded).
 func (s *Station) resolve(audioDir string) error {
+	if s.IsStream() {
+		return nil // live radio: nothing on disk to resolve
+	}
 	if s.Source != "" && len(s.Tracks) == 0 {
 		if err := s.scanFolder(expand(s.Source)); err != nil {
 			return err
