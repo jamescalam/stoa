@@ -1,0 +1,69 @@
+# GoReleaser config for stoa. Builds a macOS universal binary (cgo-enabled, so
+# the release must run on a macOS runner), publishes a GitHub Release, and
+# updates the Homebrew tap formula.
+#
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: stoa
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: stoa
+    main: .
+    binary: stoa
+    # cgo is required for the macOS media integration; darwin only.
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+# Merge the two arch binaries into one universal binary.
+universal_binaries:
+  - id: stoa
+    replace: true
+
+archives:
+  - id: stoa
+    ids:
+      - stoa
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: stoa
+    ids:
+      - stoa
+    repository:
+      owner: jamescalam
+      name: homebrew-stoa
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/jamescalam/stoa"
+    description: "Minimal in-terminal music radio with a Greco-Roman visualizer"
+    license: "MIT"
+    install: |
+      bin.install "stoa"
+    test: |
+      system "#{bin}/stoa", "--version"

@@ -1,4 +1,4 @@
-module stoa
+module github.com/jamescalam/stoa
 
 go 1.25.2
 

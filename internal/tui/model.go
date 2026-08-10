@@ -12,10 +12,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"stoa/internal/media"
-	"stoa/internal/player"
-	"stoa/internal/scene"
-	"stoa/internal/station"
+	"github.com/jamescalam/stoa/internal/media"
+	"github.com/jamescalam/stoa/internal/player"
+	"github.com/jamescalam/stoa/internal/scene"
+	"github.com/jamescalam/stoa/internal/station"
 )
 
 var (

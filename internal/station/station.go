@@ -11,7 +11,7 @@ import (
 	"github.com/dhowden/tag"
 	"gopkg.in/yaml.v3"
 
-	"stoa/internal/config"
+	"github.com/jamescalam/stoa/internal/config"
 )
 
 // Track is a single playable item plus the metadata we display and credit.

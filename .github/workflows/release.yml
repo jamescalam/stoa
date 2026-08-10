@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # macOS runner is required: the build is cgo-enabled and links the macOS
+    # MediaPlayer/AppKit frameworks, so it cannot be cross-compiled from Linux.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          # Provided automatically; used to create the GitHub Release.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PAT with 'contents: write' on jamescalam/homebrew-stoa so the
+          # formula can be pushed to the tap. Create it as a repo secret.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

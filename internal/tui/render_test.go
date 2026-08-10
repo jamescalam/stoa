@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"stoa/internal/player"
-	"stoa/internal/scene"
-	"stoa/internal/station"
+	"github.com/jamescalam/stoa/internal/player"
+	"github.com/jamescalam/stoa/internal/scene"
+	"github.com/jamescalam/stoa/internal/station"
 )
 
 // TestLayoutIntegration verifies the scene fills the middle while the picker

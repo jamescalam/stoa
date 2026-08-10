@@ -20,7 +20,7 @@ import (
 	"github.com/gopxl/beep/v2/vorbis"
 	"github.com/gopxl/beep/v2/wav"
 
-	"stoa/internal/station"
+	"github.com/jamescalam/stoa/internal/station"
 )
 
 // Event is emitted whenever the now-playing state changes.
