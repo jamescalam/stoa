@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/jamescalam/stoa/internal/media"
 	"github.com/jamescalam/stoa/internal/player"
@@ -18,36 +19,110 @@ import (
 	"github.com/jamescalam/stoa/internal/station"
 )
 
-var (
-	ivory     = lipgloss.Color("#e8e2d0")
-	dim       = lipgloss.Color("#7a7466")
-	terracota = lipgloss.Color("#c96f4c")
-	bronze    = lipgloss.Color("#8a9b6e")
+// palette is the small set of colour roles every chrome style is derived from.
+// It drives the interface only — the visualizer paints its own RGB and is never
+// touched by the active theme.
+type palette struct {
+	text      lipgloss.Color   // primary readable text (titles, names)
+	dim       lipgloss.Color   // muted text (descriptions, help, empties)
+	accent    lipgloss.Color   // headline accent (title, transport, progress, live)
+	secondary lipgloss.Color   // numerals and panel borders
+	gradient  []lipgloss.Color // logo wordmark ramp, low→high
+}
 
-	titleStyle    = lipgloss.NewStyle().Foreground(terracota).Bold(true)
-	numeralStyle  = lipgloss.NewStyle().Foreground(bronze).Bold(true)
-	nameStyle     = lipgloss.NewStyle().Foreground(ivory)
-	descStyle     = lipgloss.NewStyle().Foreground(dim).Italic(true)
-	selectedStyle = lipgloss.NewStyle().Foreground(terracota).Bold(true)
-	helpStyle     = lipgloss.NewStyle().Foreground(dim)
-	errStyle      = lipgloss.NewStyle().Foreground(terracota)
+// theme is a named palette shown in the settings menu.
+type theme struct {
+	name string
+	pal  palette
+}
 
-	panelStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(bronze).Padding(0, 2)
-	trackStyle  = lipgloss.NewStyle().Foreground(ivory).Bold(true)
-	btnStyle    = lipgloss.NewStyle().Foreground(ivory)
-	ppStyle     = lipgloss.NewStyle().Foreground(terracota).Bold(true)
-	timeStyle   = lipgloss.NewStyle().Foreground(dim)
-	progFill    = lipgloss.NewStyle().Foreground(terracota)
-	progKnob    = lipgloss.NewStyle().Foreground(ivory)
-	progEmpty   = lipgloss.NewStyle().Foreground(dim)
-	liveStyle   = lipgloss.NewStyle().Foreground(terracota).Bold(true)
-	volFull     = lipgloss.NewStyle().Foreground(terracota)
-	volEmpty    = lipgloss.NewStyle().Foreground(dim)
-	volCapStyle = lipgloss.NewStyle().Foreground(dim)
-)
+// themes lists the selectable interface themes. The first is the default.
+var themes = []theme{
+	{
+		name: "Vector Protocol", // cyberpunk: deep purple dim, neon green/cyan
+		pal: palette{
+			text:      lipgloss.Color("#EEFFFF"),
+			dim:       lipgloss.Color("#6766b3"),
+			accent:    lipgloss.Color("#00FF9C"),
+			secondary: lipgloss.Color("#00b0ff"),
+			gradient: []lipgloss.Color{
+				lipgloss.Color("#00FF9C"),
+				lipgloss.Color("#00ffc8"),
+				lipgloss.Color("#00b0ff"),
+				lipgloss.Color("#6095ff"),
+				lipgloss.Color("#EEFFFF"),
+			},
+		},
+	},
+	{
+		name: "Greco-Roman", // warm ivory, terracota and olive-bronze
+		pal: palette{
+			text:      lipgloss.Color("#e8e2d0"),
+			dim:       lipgloss.Color("#7a7466"),
+			accent:    lipgloss.Color("#c96f4c"),
+			secondary: lipgloss.Color("#8a9b6e"),
+			gradient: []lipgloss.Color{
+				lipgloss.Color("#8a9b6e"),
+				lipgloss.Color("#b0824f"),
+				lipgloss.Color("#c96f4c"),
+				lipgloss.Color("#d98b63"),
+				lipgloss.Color("#e8e2d0"),
+			},
+		},
+	},
+}
+
+// styleSet holds every lipgloss style the interface uses, derived from one
+// palette so switching themes is a single rebuild.
+type styleSet struct {
+	title, numeral, name, desc, selected, help, err        lipgloss.Style
+	panel, track, btn, pp, timeS                           lipgloss.Style
+	progFill, progKnob, progEmpty, live, volFull, volEmpty lipgloss.Style
+	volCap, logo, setHead, setSel, setDim                  lipgloss.Style
+	gradient                                               []lipgloss.Color
+}
+
+// newStyles builds a styleSet from a palette.
+func newStyles(p palette) styleSet {
+	rounded := func(border lipgloss.Color, padX int) lipgloss.Style {
+		return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(border).Padding(0, padX)
+	}
+	return styleSet{
+		title:     lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		numeral:   lipgloss.NewStyle().Foreground(p.secondary).Bold(true),
+		name:      lipgloss.NewStyle().Foreground(p.text),
+		desc:      lipgloss.NewStyle().Foreground(p.dim).Italic(true),
+		selected:  lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		help:      lipgloss.NewStyle().Foreground(p.dim),
+		err:       lipgloss.NewStyle().Foreground(p.accent),
+		panel:     rounded(p.secondary, 2),
+		track:     lipgloss.NewStyle().Foreground(p.text).Bold(true),
+		btn:       lipgloss.NewStyle().Foreground(p.text),
+		pp:        lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		timeS:     lipgloss.NewStyle().Foreground(p.dim),
+		progFill:  lipgloss.NewStyle().Foreground(p.accent),
+		progKnob:  lipgloss.NewStyle().Foreground(p.text),
+		progEmpty: lipgloss.NewStyle().Foreground(p.dim),
+		live:      lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		volFull:   lipgloss.NewStyle().Foreground(p.accent),
+		volEmpty:  lipgloss.NewStyle().Foreground(p.dim),
+		volCap:    lipgloss.NewStyle().Foreground(p.dim),
+		// The logo box wears the accent border, in the spirit of charmbracelet's
+		// crush and our own slackterm wordmark.
+		logo:     rounded(p.accent, 1),
+		setHead:  lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		setSel:   lipgloss.NewStyle().Foreground(p.accent).Bold(true),
+		setDim:   lipgloss.NewStyle().Foreground(p.dim),
+		gradient: p.gradient,
+	}
+}
 
 const (
-	volBarHeight  = 3
+	volBarHeight = 3
+	// barContentH is the height of the player bar's content (the tallest region,
+	// the 4-line volume meter and track info). The inline logo matches it so the
+	// two boxes share a bottom edge.
+	barContentH   = volBarHeight + 1
 	leftColWidth  = 20
 	colGap        = 3
 	frameInterval = 125 * time.Millisecond
@@ -68,6 +143,9 @@ type Model struct {
 
 	now      player.Event
 	hasNow   bool
+	active   bool   // a station has been selected: hide the picker, show the scene
+	curNum   string // numeral of the selected station (for the player bar)
+	curName  string // name of the selected station (for the player bar)
 	elapsed  time.Duration
 	total    time.Duration
 	err      error
@@ -78,6 +156,11 @@ type Model struct {
 	startedAt   time.Time        // animation clock origin
 	animElapsed time.Duration    // wall-clock time the scene has been running
 	renderMode  scene.RenderMode // ModeColorRamp (default) or ModeHalfBlock
+
+	settings bool     // settings menu open (ctrl+s)
+	themeIdx int      // index into themes; drives st
+	setSel   int      // cursor within the settings theme list
+	st       styleSet // styles for the active theme
 }
 
 // New builds the root model.
@@ -91,7 +174,17 @@ func New(stations []station.Station, p *player.Player, m *media.Service) Model {
 		volLevel:  lvl,
 		volMax:    max,
 		startedAt: time.Now(),
+		st:        newStyles(themes[0].pal), // default theme: Vector Protocol
 	}
+}
+
+// applyTheme switches to themes[i] and rebuilds the interface styles.
+func (m *Model) applyTheme(i int) {
+	if i < 0 || i >= len(themes) {
+		return
+	}
+	m.themeIdx = i
+	m.st = newStyles(themes[i].pal)
 }
 
 // Init starts the player event listener and the animation frame loop.
@@ -146,10 +239,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listen(m.player)
 
 	case tea.KeyMsg:
+		// Quit and the settings toggle work from any view.
 		switch msg.String() {
-		case "q", "ctrl+c", "esc":
+		case "ctrl+c":
 			m.player.Close()
 			return m, tea.Quit
+		case "ctrl+s":
+			m.settings = !m.settings
+			if m.settings {
+				m.setSel = m.themeIdx
+			}
+			return m, nil
+		}
+
+		// While the settings menu is open it owns navigation.
+		if m.settings {
+			switch msg.String() {
+			case "esc", "enter", "q":
+				m.settings = false
+			case "up", "k":
+				if m.setSel > 0 {
+					m.setSel--
+					m.applyTheme(m.setSel) // live preview
+				}
+			case "down", "j":
+				if m.setSel < len(themes)-1 {
+					m.setSel++
+					m.applyTheme(m.setSel)
+				}
+			}
+			return m, nil
+		}
+
+		switch msg.String() {
+		case "q":
+			m.player.Close()
+			return m, tea.Quit
+		case "esc":
+			// Back to the station picker without interrupting playback: the
+			// player bar and logo stay pinned at the bottom.
+			m.active = false
 		case "up", "k":
 			if m.sel > 0 {
 				m.sel--
@@ -193,6 +322,8 @@ func (m *Model) play() {
 		return
 	}
 	s := m.stations[m.sel]
+	m.active = true
+	m.curNum, m.curName = s.Numeral, s.Name
 	if s.IsStream() {
 		m.player.PlayStream(s.Name, s.Stream)
 	} else {
@@ -213,42 +344,131 @@ func (m Model) View() string {
 	}
 
 	if len(m.stations) == 0 {
-		return "\n  " + titleStyle.Render("S T O A") + "\n\n" +
-			"  " + descStyle.Render("no stations found in ~/.config/stoa/stations") + "\n\n" +
-			"  " + helpStyle.Render("q quit")
+		return "\n  " + m.st.title.Render("R A D I O S") + "\n\n" +
+			"  " + m.st.desc.Render("no stations found in ~/.config/stoa/stations") + "\n\n" +
+			"  " + m.st.help.Render("q quit")
 	}
 
-	top := []string{"", "  " + titleStyle.Render("S T O A"), ""}
-	for i, s := range m.stations {
-		cursor := "   "
-		numeral := numeralStyle.Render(pad(s.Numeral, 4))
-		name := nameStyle.Render(pad(s.Name, 12))
-		if i == m.sel {
-			cursor = " " + selectedStyle.Render("›") + " "
-			name = selectedStyle.Render(pad(s.Name, 12))
+	help := "  " + m.st.help.Render(m.helpText())
+
+	// The logo sits inline to the right of the player bar, sharing its height.
+	logo := m.logoView(barContentH)
+	bar := m.playerBar(w - lipgloss.Width(logo))
+	barRow := lipgloss.JoinHorizontal(lipgloss.Top, bar, logo)
+	bottom := append([]string{help}, strings.Split(barRow, "\n")...)
+
+	bodyRows := h - len(bottom)
+	if bodyRows < 0 {
+		bodyRows = 0
+	}
+
+	var body []string
+	switch {
+	case m.settings:
+		body = m.settingsView(bodyRows)
+	case m.active:
+		// A station is selected: the visualizer takes over the whole body; the
+		// picker is gone (its identity now lives in the player bar).
+		if m.viz != nil && bodyRows >= 1 {
+			body = strings.Split(m.viz.Frame(w, bodyRows, m.animElapsed, m.renderMode), "\n")
+		} else {
+			body = make([]string, bodyRows)
 		}
-		top = append(top, cursor+numeral+name+"  "+descStyle.Render(s.Description))
+	default:
+		body = m.pickerView(bodyRows)
 	}
 
-	help := "  " + helpStyle.Render("↑/↓ station · space play/pause · ←/→ prev/next · -/+ vol · v style · q quit")
-	bottom := append([]string{help}, strings.Split(m.playerBar(w), "\n")...)
-
-	sceneRows := h - len(top) - len(bottom)
-	var mid []string
-	if m.viz != nil && sceneRows >= 1 {
-		mid = strings.Split(m.viz.Frame(w, sceneRows, m.animElapsed, m.renderMode), "\n")
-	} else {
-		if sceneRows < 0 {
-			sceneRows = 0
-		}
-		mid = make([]string, sceneRows)
-	}
-
-	lines := make([]string, 0, len(top)+len(mid)+len(bottom))
-	lines = append(lines, top...)
-	lines = append(lines, mid...)
+	lines := make([]string, 0, len(body)+len(bottom))
+	lines = append(lines, body...)
 	lines = append(lines, bottom...)
 	return strings.Join(lines, "\n")
+}
+
+// helpText is the keybinding hint under the body, adapted to the current view.
+func (m Model) helpText() string {
+	if m.settings {
+		return "↑/↓ theme · enter/esc close · q quit"
+	}
+	return "↑/↓ station · space play/pause · ←/→ prev/next · -/+ vol · ctrl+s settings · esc stations · v style · q quit"
+}
+
+// pickerView is the idle body: the S T O A masthead over the station list.
+func (m Model) pickerView(rows int) []string {
+	body := make([]string, 0, rows)
+	body = append(body, "", "  "+m.st.title.Render("S T O A"), "")
+	for i, s := range m.stations {
+		cursor := "   "
+		numeral := m.st.numeral.Render(pad(s.Numeral, 4))
+		name := m.st.name.Render(pad(s.Name, 12))
+		if i == m.sel {
+			cursor = " " + m.st.selected.Render("›") + " "
+			name = m.st.selected.Render(pad(s.Name, 12))
+		}
+		body = append(body, cursor+numeral+name+"  "+m.st.desc.Render(s.Description))
+	}
+	for len(body) < rows {
+		body = append(body, "")
+	}
+	return body
+}
+
+// settingsView is the settings body: currently a single theme picker. Themes
+// restyle the interface only; the visualizer keeps its own colours.
+func (m Model) settingsView(rows int) []string {
+	body := make([]string, 0, rows)
+	body = append(body, "", "  "+m.st.setHead.Render("C O N F I G"), "")
+	body = append(body, "  "+m.st.setDim.Render("Theme"), "")
+	for i, t := range themes {
+		cursor := "   "
+		label := m.st.name.Render(t.name)
+		if i == m.setSel {
+			cursor = " " + m.st.setSel.Render("›") + " "
+			label = m.st.setSel.Render(t.name)
+		}
+		mark := ""
+		if i == m.themeIdx {
+			mark = "  " + m.st.setDim.Render("(active)")
+		}
+		body = append(body, cursor+label+mark)
+	}
+	body = append(body, "", "  "+m.st.setDim.Render("themes restyle the interface, not the colonnade"))
+	for len(body) < rows {
+		body = append(body, "")
+	}
+	if len(body) > rows {
+		body = body[:rows]
+	}
+	return body
+}
+
+// logoView renders the branded masthead: a gradient wordmark over a rule,
+// inside a rounded accent box whose content is centred in a contentH-tall cell
+// so the box lines up with the player bar beside it.
+func (m Model) logoView(contentH int) string {
+	art := lipgloss.JoinVertical(lipgloss.Center,
+		m.gradientRunes("▞▚ s t o a"),
+		m.gradientRunes(strings.Repeat("─", 10)),
+	)
+	return m.st.logo.Height(contentH).AlignVertical(lipgloss.Center).Render(art)
+}
+
+// gradientRunes colours each rune of s along the active theme's logo gradient
+// (bold), so the wordmark fades across its width.
+func (m Model) gradientRunes(s string) string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return s
+	}
+	grad := m.st.gradient
+	if len(grad) == 0 {
+		return s
+	}
+	var b strings.Builder
+	for i, r := range runes {
+		c := grad[i*len(grad)/len(runes)]
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Bold(true).Render(string(r)))
+	}
+	return b.String()
 }
 
 // playerBar composes the three regions into one bordered panel that spans the
@@ -266,7 +486,7 @@ func (m Model) playerBar(w int) string {
 	if m.err != nil {
 		msgW := contentW - lipgloss.Width(vol) - colGap
 		row = lipgloss.JoinHorizontal(lipgloss.Center,
-			errStyle.Render(pad(truncate("! "+m.err.Error(), msgW), msgW)), gap, vol)
+			m.st.err.Render(pad(truncate("! "+m.err.Error(), msgW), msgW)), gap, vol)
 	} else {
 		left := m.trackInfo()
 		centerW := contentW - lipgloss.Width(left) - lipgloss.Width(vol) - 2*colGap
@@ -276,11 +496,17 @@ func (m Model) playerBar(w int) string {
 		row = lipgloss.JoinHorizontal(lipgloss.Center,
 			left, gap, m.controlsAndProgress(centerW), gap, vol)
 	}
-	return panelStyle.Width(w - 2).Render(row)
+	return m.st.panel.Width(w - 2).Render(row)
 }
 
-// trackInfo is the left region: title / artist / station·position.
+// trackInfo is the left region: station identity (numeral · name) over the
+// track title / artist / position. The identity line is where the picker's
+// numeral and name go once a station has been selected.
 func (m Model) trackInfo() string {
+	ident := m.st.desc.Render("no station")
+	if m.curName != "" {
+		ident = m.st.numeral.Render(m.curNum) + " " + m.st.name.Render(m.curName)
+	}
 	title, artist, sub := "—", "", "select a station"
 	if m.hasNow {
 		title = m.now.Track.Title
@@ -288,15 +514,24 @@ func (m Model) trackInfo() string {
 		if m.now.Live {
 			sub = "live radio"
 		} else {
-			sub = fmt.Sprintf("%s · %d/%d", m.now.Station, m.now.Index, m.now.Total)
+			sub = fmt.Sprintf("%d/%d", m.now.Index, m.now.Total)
 		}
 	}
 	col := lipgloss.NewStyle().Width(leftColWidth)
 	return col.Render(lipgloss.JoinVertical(lipgloss.Left,
-		trackStyle.Render(truncate(title, leftColWidth)),
-		descStyle.Render(truncate(artist, leftColWidth)),
-		timeStyle.Render(truncate(sub, leftColWidth)),
+		truncateStyled(ident, leftColWidth),
+		m.st.track.Render(truncate(title, leftColWidth)),
+		m.st.desc.Render(truncate(artist, leftColWidth)),
+		m.st.timeS.Render(truncate(sub, leftColWidth)),
 	))
+}
+
+// truncateStyled trims an already-styled string to n cells, ANSI-aware.
+func truncateStyled(s string, n int) string {
+	if lipgloss.Width(s) <= n {
+		return s
+	}
+	return ansi.Truncate(s, n-1, "") + "…"
 }
 
 // controlsAndProgress is the center region: transport row over a seek bar.
@@ -305,12 +540,12 @@ func (m Model) controlsAndProgress(width int) string {
 	if m.hasNow && m.now.Playing {
 		pp = "⏸"
 	}
-	controls := btnStyle.Render("⏮") + "   " + ppStyle.Render(pp) + "   " + btnStyle.Render("⏭")
+	controls := m.st.btn.Render("⏮") + "   " + m.st.pp.Render(pp) + "   " + m.st.btn.Render("⏭")
 	controlsRow := lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(controls)
 
 	// Live streams have no duration or seek — show an on-air indicator instead.
 	if m.hasNow && m.now.Live {
-		line := liveStyle.Render("◉ LIVE") + timeStyle.Render("   "+fmtDur(m.elapsed)+" on air")
+		line := m.st.live.Render("◉ LIVE") + m.st.timeS.Render("   "+fmtDur(m.elapsed)+" on air")
 		liveRow := lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(line)
 		return lipgloss.JoinVertical(lipgloss.Center, controlsRow, liveRow)
 	}
@@ -325,7 +560,7 @@ func (m Model) controlsAndProgress(width int) string {
 	if m.total > 0 {
 		frac = float64(m.elapsed) / float64(m.total)
 	}
-	progRow := timeStyle.Render(el) + " " + progressBar(barW, frac) + " " + timeStyle.Render(tot)
+	progRow := m.st.timeS.Render(el) + " " + m.progressBar(barW, frac) + " " + m.st.timeS.Render(tot)
 
 	return lipgloss.JoinVertical(lipgloss.Center, controlsRow, progRow)
 }
@@ -340,17 +575,17 @@ func (m Model) volumeMeter() string {
 	rows := make([]string, 0, volBarHeight)
 	for i := volBarHeight - 1; i >= 0; i-- {
 		if i < filled {
-			rows = append(rows, volFull.Render("┃"))
+			rows = append(rows, m.st.volFull.Render("┃"))
 		} else {
-			rows = append(rows, volEmpty.Render("╎"))
+			rows = append(rows, m.st.volEmpty.Render("╎"))
 		}
 	}
 	bar := lipgloss.JoinVertical(lipgloss.Center, rows...)
-	return lipgloss.JoinVertical(lipgloss.Center, bar, volCapStyle.Render(fmt.Sprintf("%2d", m.volLevel)))
+	return lipgloss.JoinVertical(lipgloss.Center, bar, m.st.volCap.Render(fmt.Sprintf("%2d", m.volLevel)))
 }
 
 // progressBar renders a Spotify-style filled bar with a knob at the play head.
-func progressBar(width int, frac float64) string {
+func (m Model) progressBar(width int, frac float64) string {
 	if width < 1 {
 		width = 1
 	}
@@ -363,7 +598,7 @@ func progressBar(width int, frac float64) string {
 	knob := int(frac * float64(width-1))
 	filled := strings.Repeat("━", knob)
 	empty := strings.Repeat("─", width-knob-1)
-	return progFill.Render(filled) + progKnob.Render("●") + progEmpty.Render(empty)
+	return m.st.progFill.Render(filled) + m.st.progKnob.Render("●") + m.st.progEmpty.Render(empty)
 }
 
 func fmtDur(d time.Duration) string {
