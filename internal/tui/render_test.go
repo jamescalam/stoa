@@ -11,28 +11,48 @@ import (
 	"github.com/jamescalam/stoa/internal/station"
 )
 
-// TestLayoutIntegration verifies the scene fills the middle while the picker
-// and player bar stay on screen, and that View is exactly h lines.
+// TestLayoutIntegration verifies View is exactly h lines in both states, that
+// an active station swaps the picker for the scene (its identity moving to the
+// player bar), and that the idle picker lists stations. The logo box stays
+// pinned bottom-right throughout.
 func TestLayoutIntegration(t *testing.T) {
-	m := Model{
+	base := Model{
 		stations: []station.Station{{Numeral: "I", Name: "OUTRUN", Description: "x"}},
 		viz:      scene.Colonnade{},
 		volLevel: 7, volMax: 10, w: 80, h: 24,
 		animElapsed: 60 * time.Second,
+		st:          newStyles(themes[0].pal),
 	}
 
+	// Idle: the picker is on screen, the scene is not.
+	idle := base.View()
+	if got := len(strings.Split(idle, "\n")); got != 24 {
+		t.Fatalf("idle: got %d lines, want 24", got)
+	}
+	if !strings.Contains(idle, "OUTRUN") {
+		t.Error("idle: expected the station picker on screen")
+	}
+	if !strings.Contains(idle, "s t o a") {
+		t.Error("idle: expected the logo masthead on screen")
+	}
+
+	// Active: the scene fills the body, the picker list is gone, and the
+	// station identity now lives in the player bar.
+	m := base
+	m.active = true
+	m.curNum, m.curName = "I", "OUTRUN"
 	v := m.View()
 	if got := len(strings.Split(v, "\n")); got != 24 {
-		t.Fatalf("got %d lines, want 24", got)
+		t.Fatalf("active: got %d lines, want 24", got)
 	}
 	if !strings.Contains(v, "\x1b[38;2") {
-		t.Error("expected coloured scene cells in the middle")
+		t.Error("active: expected coloured scene cells in the body")
 	}
 	if !strings.Contains(v, "╰") {
-		t.Error("expected the player bar border to stay on screen")
+		t.Error("active: expected the player bar border on screen")
 	}
 	if !strings.Contains(v, "OUTRUN") {
-		t.Error("expected the station picker to stay on screen")
+		t.Error("active: expected the station identity in the player bar")
 	}
 }
 
@@ -43,12 +63,14 @@ func TestRenderStates(t *testing.T) {
 		{Numeral: "I", Name: "OUTRUN", Description: "no-vocal synthwave for night driving"},
 		{Numeral: "II", Name: "NOCTURNE", Description: "slow ambient for deep focus"},
 	}
-	base := Model{stations: stations, volLevel: 7, volMax: 10, w: 78, h: 20}
+	base := Model{stations: stations, viz: scene.Colonnade{}, volLevel: 7, volMax: 10, w: 78, h: 20, st: newStyles(themes[0].pal)}
 
-	fmt.Println("\n===== IDLE =====")
+	fmt.Println("\n===== IDLE (picker, no scene) =====")
 	fmt.Println(base.View())
 
 	playing := base
+	playing.active = true
+	playing.curNum, playing.curName = "I", "OUTRUN"
 	playing.hasNow = true
 	playing.now = player.Event{
 		Station: "OUTRUN",
