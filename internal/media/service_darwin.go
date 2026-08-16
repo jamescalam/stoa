@@ -4,13 +4,19 @@ package media
 
 /*
 #cgo CFLAGS: -x objective-c -Wno-deprecated-declarations
-#cgo LDFLAGS: -framework MediaPlayer -framework Foundation -framework AppKit
+#cgo LDFLAGS: -framework MediaPlayer -framework Foundation -framework AppKit -framework CoreAudio
 
 #include <stdint.h>
 #include <stdlib.h>
 
 #import <AppKit/AppKit.h>
 #import <MediaPlayer/MediaPlayer.h>
+#import <CoreAudio/CoreAudio.h>
+
+// Older SDKs spell the master element differently.
+#ifndef kAudioObjectPropertyElementMain
+#define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
+#endif
 
 // Implemented in Go. All static functions below have internal linkage, which
 // is what lets this preamble coexist with //export in one file.
@@ -114,11 +120,88 @@ static void tickRunLoop(void) {
 	[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
 	                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
 }
+
+// DevInfo carries the current output device's name, its active data-source name
+// (e.g. "Headphones" on built-in output) and its transport type FourCC. name
+// and source are malloc'd and owned by the caller (may be NULL).
+typedef struct DevInfo {
+	char *name;
+	char *source;
+	uint32_t transport;
+} DevInfo;
+
+static char *cfCopy(CFStringRef s) {
+	if (!s) return NULL;
+	CFIndex max = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
+	char *buf = (char *)malloc(max);
+	if (!buf) return NULL;
+	if (!CFStringGetCString(s, buf, max, kCFStringEncodingUTF8)) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+// currentOutputDevice reads the system default output device's name, transport
+// type and active output data-source name via CoreAudio.
+static DevInfo currentOutputDevice(void) {
+	DevInfo di = {NULL, NULL, 0};
+
+	AudioObjectPropertyAddress addr = {
+		kAudioHardwarePropertyDefaultOutputDevice,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMain,
+	};
+	AudioObjectID dev = kAudioObjectUnknown;
+	UInt32 sz = sizeof(dev);
+	if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &sz, &dev) != noErr ||
+	    dev == kAudioObjectUnknown) {
+		return di;
+	}
+
+	CFStringRef name = NULL;
+	sz = sizeof(name);
+	addr.mSelector = kAudioObjectPropertyName;
+	if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &sz, &name) == noErr && name) {
+		di.name = cfCopy(name);
+		CFRelease(name);
+	}
+
+	UInt32 transport = 0;
+	sz = sizeof(transport);
+	addr.mSelector = kAudioDevicePropertyTransportType;
+	if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &sz, &transport) == noErr) {
+		di.transport = transport;
+	}
+
+	// The active data source distinguishes built-in speakers from the headphone
+	// jack; it isn't present on every device.
+	AudioObjectPropertyAddress srcAddr = {
+		kAudioDevicePropertyDataSource,
+		kAudioDevicePropertyScopeOutput,
+		kAudioObjectPropertyElementMain,
+	};
+	UInt32 srcID = 0;
+	sz = sizeof(srcID);
+	if (AudioObjectGetPropertyData(dev, &srcAddr, 0, NULL, &sz, &srcID) == noErr) {
+		CFStringRef srcName = NULL;
+		AudioValueTranslation tr = {&srcID, sizeof(srcID), &srcName, sizeof(srcName)};
+		UInt32 tsz = sizeof(tr);
+		srcAddr.mSelector = kAudioDevicePropertyDataSourceNameForIDCFString;
+		if (AudioObjectGetPropertyData(dev, &srcAddr, 0, NULL, &tsz, &tr) == noErr && srcName) {
+			di.source = cfCopy(srcName);
+			CFRelease(srcName);
+		}
+	}
+
+	return di;
+}
 */
 import "C"
 
 import (
 	"runtime/cgo"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -200,6 +283,72 @@ func (s *Service) invoke(c command) {
 	if f != nil {
 		f()
 	}
+}
+
+// CurrentDevice reports the system default audio output device. It queries
+// CoreAudio directly (cheap, thread-safe) so the caller can poll it.
+func (s *Service) CurrentDevice() Device {
+	di := C.currentOutputDevice()
+	name := C.GoString(di.name)
+	source := C.GoString(di.source)
+	if di.name != nil {
+		C.free(unsafe.Pointer(di.name))
+	}
+	if di.source != nil {
+		C.free(unsafe.Pointer(di.source))
+	}
+	return Device{Name: name, Kind: classifyDevice(uint32(di.transport), name, source)}
+}
+
+// classifyDevice maps a CoreAudio transport type (plus name/data-source hints)
+// to a DeviceKind for iconography.
+func classifyDevice(transport uint32, name, source string) DeviceKind {
+	ln, ls := strings.ToLower(name), strings.ToLower(source)
+	has := func(hay string, kws ...string) bool {
+		for _, kw := range kws {
+			if strings.Contains(hay, kw) {
+				return true
+			}
+		}
+		return false
+	}
+	headphoneish := has(ln, "headphone", "headset", "airpod", "earbud", "buds", "beats") ||
+		strings.Contains(ls, "headphone")
+	// Names that read as a speaker rather than something worn on the head.
+	speakerish := has(ln, "speaker", "soundbar", "homepod", "sonos", "echo", "soundlink", "boom", "flip", "charge", "monitor", "display", "tv")
+	switch transport {
+	case fourCC("bltn"): // built-in: speakers unless the headphone jack is live
+		if strings.Contains(ls, "headphone") {
+			return DeviceHeadphones
+		}
+		return DeviceSpeaker
+	case fourCC("blue"), fourCC("blte"):
+		// Most Bluetooth audio is headphones/earbuds; treat it as such unless the
+		// name clearly reads as a speaker.
+		if speakerish && !headphoneish {
+			return DeviceBluetooth
+		}
+		return DeviceHeadphones
+	case fourCC("usb "):
+		if headphoneish {
+			return DeviceHeadphones
+		}
+		return DeviceUSB
+	case fourCC("hdmi"), fourCC("dprt"):
+		return DeviceDisplay
+	case fourCC("airp"):
+		return DeviceAirPlay
+	default:
+		if headphoneish {
+			return DeviceHeadphones
+		}
+		return DeviceSpeaker
+	}
+}
+
+// fourCC packs a 4-byte CoreAudio transport code into a uint32.
+func fourCC(s string) uint32 {
+	return uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3])
 }
 
 // Update publishes now-playing state (latest-wins; never blocks).

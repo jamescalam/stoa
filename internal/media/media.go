@@ -27,3 +27,24 @@ type Commands struct {
 	Prev      func()
 	Stop      func()
 }
+
+// DeviceKind classifies the current audio output device so the UI can pick an
+// icon for it.
+type DeviceKind int
+
+const (
+	DeviceUnknown    DeviceKind = iota
+	DeviceSpeaker               // built-in / desktop speakers
+	DeviceHeadphones            // wired, USB or Bluetooth headphones/earbuds
+	DeviceDisplay               // HDMI / DisplayPort (external monitor)
+	DeviceAirPlay               // AirPlay target
+	DeviceBluetooth             // Bluetooth output that isn't clearly headphones
+	DeviceUSB                   // USB output that isn't clearly headphones
+)
+
+// Device is the system's current default audio output device. Name is empty
+// when the platform can't report one (everything but macOS today).
+type Device struct {
+	Name string
+	Kind DeviceKind
+}

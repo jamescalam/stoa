@@ -151,6 +151,7 @@ type Model struct {
 	err      error
 	volLevel int
 	volMax   int
+	device   media.Device // current system audio output device
 	w, h     int
 
 	startedAt   time.Time        // animation clock origin
@@ -209,6 +210,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.animElapsed = time.Time(msg).Sub(m.startedAt)
 		if el, ok := m.player.Progress(); ok {
 			m.elapsed = el
+		}
+		if m.media != nil {
+			m.device = m.media.CurrentDevice()
 		}
 		return m, frameTick()
 
@@ -480,7 +484,18 @@ func (m Model) playerBar(w int) string {
 	}
 
 	gap := strings.Repeat(" ", colGap)
-	vol := m.volumeMeter()
+
+	// Budget the device name so the centre (transport + seek) keeps at least
+	// minCenter cells; the readout's fixed furniture (icon, level, separators)
+	// is ~8 cells. On narrow terminals the name shrinks, then drops entirely.
+	const minCenter, readoutFurniture = 20, 8
+	nameMax := contentW - leftColWidth - minCenter - 2*colGap - readoutFurniture
+	if nameMax < 0 {
+		nameMax = 0
+	} else if nameMax > 24 {
+		nameMax = 24
+	}
+	vol := m.volumeMeter(nameMax)
 
 	var row string
 	if m.err != nil {
@@ -565,8 +580,10 @@ func (m Model) controlsAndProgress(width int) string {
 	return lipgloss.JoinVertical(lipgloss.Center, controlsRow, progRow)
 }
 
-// volumeMeter is the right region: a bottom-filled vertical bar plus readout.
-func (m Model) volumeMeter() string {
+// volumeMeter is the right region: a bottom-filled vertical bar above a
+// readout of "device name  <icon>  <level>". nameMax caps the device name (0
+// hides it) so the readout never overruns the available width.
+func (m Model) volumeMeter(nameMax int) string {
 	max := m.volMax
 	if max <= 0 {
 		max = 1
@@ -580,8 +597,36 @@ func (m Model) volumeMeter() string {
 			rows = append(rows, m.st.volEmpty.Render("╎"))
 		}
 	}
-	bar := lipgloss.JoinVertical(lipgloss.Center, rows...)
-	return lipgloss.JoinVertical(lipgloss.Center, bar, m.st.volCap.Render(fmt.Sprintf("%2d", m.volLevel)))
+	bar := lipgloss.JoinVertical(lipgloss.Right, rows...)
+
+	icon := m.st.volCap.Render(deviceIcon(m.device.Kind))
+	level := m.st.volCap.Render(fmt.Sprintf("%2d", m.volLevel))
+	readout := icon + "  " + level
+	if nameMax > 0 && m.device.Name != "" {
+		readout = m.st.timeS.Render(truncate(m.device.Name, nameMax)) + "  " + readout
+	}
+	return lipgloss.JoinVertical(lipgloss.Right, bar, readout)
+}
+
+// deviceIcon maps an output-device kind to a width-1 Nerd Font glyph
+// (FontAwesome range, so it renders in any patched font).
+func deviceIcon(k media.DeviceKind) string {
+	switch k {
+	case media.DeviceHeadphones:
+		return "" // nf-fa-headphones
+	case media.DeviceSpeaker:
+		return "" // nf-fa-volume_up
+	case media.DeviceDisplay:
+		return "" // nf-fa-desktop
+	case media.DeviceAirPlay:
+		return "" // nf-fa-wifi
+	case media.DeviceBluetooth:
+		return "" // nf-fa-bluetooth
+	case media.DeviceUSB:
+		return "" // nf-fa-usb
+	default:
+		return "" // nf-fa-volume_up
+	}
 }
 
 // progressBar renders a Spotify-style filled bar with a knob at the play head.
