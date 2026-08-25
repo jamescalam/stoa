@@ -3,7 +3,9 @@
 package station
 
 import (
+	"embed"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,6 +15,12 @@ import (
 
 	"github.com/jamescalam/stoa/internal/config"
 )
+
+// defaultStations are the built-in stations stoa ships with. They are seeded
+// into the user's stations dir on first run (see seedDefaults).
+//
+//go:embed defaults/*.yaml
+var defaultStations embed.FS
 
 // Track is a single playable item plus the metadata we display and credit.
 type Track struct {
@@ -45,6 +53,7 @@ var audioExts = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".ogg
 // the audio dir, and expands folder-source stations by scanning + tag-reading.
 func LoadAll() ([]Station, error) {
 	dir := config.StationsDir()
+	seedDefaults(dir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -69,8 +78,78 @@ func LoadAll() ([]Station, error) {
 		stations = append(stations, s)
 	}
 
-	sort.Slice(stations, func(i, j int) bool { return stations[i].Numeral < stations[j].Numeral })
+	sort.Slice(stations, func(i, j int) bool {
+		// Order by Roman-numeral value so IX sorts after VIII, not lexically
+		// before V. Fall back to string order for anything unparseable.
+		ri, rj := romanToInt(stations[i].Numeral), romanToInt(stations[j].Numeral)
+		if ri != rj && ri != 0 && rj != 0 {
+			return ri < rj
+		}
+		return stations[i].Numeral < stations[j].Numeral
+	})
 	return stations, nil
+}
+
+// romanToInt converts a Roman numeral (I, IV, XII, …) to its integer value,
+// returning 0 for anything it cannot parse so callers can fall back.
+func romanToInt(s string) int {
+	vals := map[byte]int{'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if s == "" {
+		return 0
+	}
+	total, prev := 0, 0
+	for i := len(s) - 1; i >= 0; i-- {
+		v, ok := vals[s[i]]
+		if !ok {
+			return 0
+		}
+		if v < prev {
+			total -= v
+		} else {
+			total += v
+			prev = v
+		}
+	}
+	return total
+}
+
+// seedDefaults populates dir with the built-in stations the first time stoa
+// runs. It only writes when the user has no stations yet, so their edits and
+// deletions are never clobbered. Failures are non-fatal: a user who cannot
+// write their config dir simply starts with an empty picker, as before.
+func seedDefaults(dir string) {
+	if hasYAML(dir) {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	files, err := defaultStations.ReadDir("defaults")
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		data, err := defaultStations.ReadFile(path.Join("defaults", f.Name()))
+		if err != nil {
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(dir, f.Name()), data, 0o644)
+	}
+}
+
+// hasYAML reports whether dir exists and holds at least one YAML file.
+func hasYAML(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && isYAML(e.Name()) {
+			return true
+		}
+	}
+	return false
 }
 
 func load(path string) (Station, error) {

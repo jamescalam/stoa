@@ -5,6 +5,7 @@ package player
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -150,8 +152,12 @@ func (p *Player) PlayStream(name, url string) {
 		host = u.Host
 	}
 	sseURL, metaKey, hasMeta := metadataSourceFor(url)
-	// Deliberately no "Icy-MetaData" header: we want a clean MP3 body, not one
-	// with interleaved metadata that would corrupt decoding.
+	// Streams with a dedicated metadata feed (Nightride's SSE) are pulled clean.
+	// For the rest, ask for ICY in-band metadata so we can still surface
+	// now-playing; it is de-interleaved below before the bytes reach the decoder.
+	if !hasMeta {
+		req.Header.Set("Icy-MetaData", "1")
+	}
 	resp, err := p.http.Do(req)
 	if err != nil {
 		cancel()
@@ -165,12 +171,41 @@ func (p *Player) PlayStream(name, url string) {
 		return
 	}
 
-	// Buffer the network read to absorb jitter, and keep Close wired to the body.
-	rc := &bufReadCloser{Reader: bufio.NewReaderSize(resp.Body, 256<<10), closer: resp.Body}
-	streamer, format, err := mp3.Decode(rc)
+	// Read the stream through a background prefetch buffer: a goroutine pulls
+	// from the network as fast as it arrives, keeping up to prefetchAhead bytes
+	// of already-downloaded audio ready. Brief network stalls then drain that
+	// cushion instead of starving the speaker — which is what gets heard as
+	// cutting/lag. We also wait for a small initial cushion before starting.
+	pr := newPrefetchReader(resp.Body, prefetchAhead)
+	pr.waitReady(prefetchStart, prefetchStartWait)
+
+	// If the server interleaves ICY metadata, de-interleave it before decoding
+	// and surface each StreamTitle as now-playing. The reader sits after the
+	// prefetch buffer so titles update near playback, not ~a buffer ahead.
+	var audio io.ReadCloser = pr
+	liveKey := metaKey
+	if icyInt := icyMetaInt(hasMeta, resp); icyInt > 0 {
+		liveKey = url // token identifying this stream for stale-update guarding
+		audio = newICYReader(pr, icyInt, func(title string) {
+			artist, track := splitStreamTitle(title)
+			p.mu.Lock()
+			if !p.live || p.liveKey != url {
+				p.mu.Unlock()
+				return
+			}
+			changed := track != p.liveTitle || artist != p.liveArtist
+			p.liveTitle, p.liveArtist = track, artist
+			p.mu.Unlock()
+			if changed {
+				p.emitLive()
+			}
+		})
+	}
+
+	streamer, format, err := mp3.Decode(audio)
 	if err != nil {
 		cancel()
-		resp.Body.Close()
+		pr.Close()
 		p.emitErr(fmt.Errorf("%s: %w", name, err))
 		return
 	}
@@ -198,7 +233,7 @@ func (p *Player) PlayStream(name, url string) {
 	p.paused = false
 	p.stationName = name
 	p.streamHost = host
-	p.liveKey, p.liveTitle, p.liveArtist = metaKey, "", ""
+	p.liveKey, p.liveTitle, p.liveArtist = liveKey, "", ""
 	p.tracks, p.order, p.pos = nil, nil, 0 // no track list; next/prev become no-ops
 	p.live = true
 	p.streamStop = cancel
@@ -223,6 +258,113 @@ func metadataSourceFor(streamURL string) (sseURL, key string, ok bool) {
 		return "https://nightride.fm/meta", strings.TrimSuffix(path.Base(u.Path), ".mp3"), true
 	}
 	return "", "", false
+}
+
+// icyMetaInt returns the ICY metadata interval advertised by resp, or 0 when
+// absent. It is skipped for streams that carry their own metadata feed.
+func icyMetaInt(hasMeta bool, resp *http.Response) int {
+	if hasMeta {
+		return 0
+	}
+	n, _ := strconv.Atoi(resp.Header.Get("icy-metaint"))
+	return n
+}
+
+// icyReader de-interleaves ICY (Shoutcast/Icecast) in-band metadata from an
+// audio byte stream. Every metaint bytes the server inserts a length-prefixed
+// metadata block; icyReader strips those blocks, passing only audio through to
+// the decoder and firing onMeta with each new StreamTitle it sees.
+type icyReader struct {
+	src     io.Reader
+	metaint int
+	remain  int    // audio bytes until the next metadata block
+	onMeta  func(title string)
+	last    string // suppress repeat callbacks for an unchanged title
+}
+
+func newICYReader(src io.Reader, metaint int, onMeta func(string)) *icyReader {
+	return &icyReader{src: src, metaint: metaint, remain: metaint, onMeta: onMeta}
+}
+
+func (r *icyReader) Read(p []byte) (int, error) {
+	if r.remain == 0 {
+		if err := r.consumeMeta(); err != nil {
+			return 0, err
+		}
+		r.remain = r.metaint
+	}
+	if len(p) > r.remain {
+		p = p[:r.remain] // never read past the next metadata boundary
+	}
+	n, err := r.src.Read(p)
+	r.remain -= n
+	return n, err
+}
+
+func (r *icyReader) Close() error {
+	if c, ok := r.src.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// consumeMeta reads one length-prefixed metadata block and reports its title.
+func (r *icyReader) consumeMeta() error {
+	var lenByte [1]byte
+	if _, err := io.ReadFull(r.src, lenByte[:]); err != nil {
+		return err
+	}
+	blockLen := int(lenByte[0]) * 16
+	if blockLen == 0 {
+		return nil // no metadata in this interval
+	}
+	block := make([]byte, blockLen)
+	if _, err := io.ReadFull(r.src, block); err != nil {
+		return err
+	}
+	title, ok := parseStreamTitle(block)
+	if !ok || title == r.last {
+		return nil
+	}
+	r.last = title
+	if r.onMeta != nil {
+		r.onMeta(title)
+	}
+	return nil
+}
+
+// parseStreamTitle extracts the StreamTitle value from an ICY metadata block,
+// e.g. `StreamTitle='RUDE - Eternal Youth';StreamUrl='';` (null-padded). ok is
+// false when the block carries no title.
+func parseStreamTitle(block []byte) (string, bool) {
+	s := string(bytes.TrimRight(block, "\x00"))
+	const key = "StreamTitle='"
+	i := strings.Index(s, key)
+	if i < 0 {
+		return "", false
+	}
+	s = s[i+len(key):]
+	if j := strings.Index(s, "';"); j >= 0 {
+		s = s[:j]
+	} else if j := strings.LastIndex(s, "'"); j >= 0 {
+		s = s[:j]
+	}
+	// Some stations append a promo tag, e.g. " {+info: veniceclassicradio.eu}".
+	if j := strings.LastIndex(s, " {"); j >= 0 && strings.HasSuffix(s, "}") {
+		s = s[:j]
+	}
+	return strings.TrimSpace(s), true
+}
+
+// splitStreamTitle turns an ICY StreamTitle (conventionally "Artist - Title")
+// into separate artist and track fields. With no " - " separator the whole
+// string is treated as the track.
+func splitStreamTitle(s string) (artist, track string) {
+	s = strings.TrimSpace(s)
+	if a, t, ok := strings.Cut(s, " - "); ok {
+		return strings.TrimSpace(a), strings.TrimSpace(t)
+	}
+	return "", s
 }
 
 // pollMetadata keeps an SSE connection to the metadata endpoint open, updating
@@ -318,13 +460,114 @@ func (p *Player) stopStream() {
 	}
 }
 
-// bufReadCloser adds buffering to a stream while closing the underlying body.
-type bufReadCloser struct {
-	*bufio.Reader
-	closer io.Closer
+// Prefetch buffer sizing, expressed in bytes but chosen for ~128 kbps streams
+// (≈16 KB/s). prefetchAhead is the most already-downloaded audio we hold ahead
+// of playback — big enough to ride out multi-second stalls, small enough that
+// live now-playing metadata (e.g. Nightride) stays roughly in sync. Steady
+// state, playback runs about prefetchAhead/bitrate behind the live edge.
+const (
+	prefetchAhead     = 192 << 10 // ~12s cushion of read-ahead audio
+	prefetchStart     = 48 << 10  // ~3s buffered before playback begins
+	prefetchStartWait = 2 * time.Second
+)
+
+// prefetchReader turns a network stream into a background-filled buffer. A
+// goroutine reads from src as fast as it delivers, holding up to capBytes ahead
+// of the consumer; Read blocks (yielding clean silence, not garbage) only when
+// the cushion is fully drained. This absorbs the jitter that otherwise makes a
+// live stream cut in and out.
+type prefetchReader struct {
+	src io.ReadCloser
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	buf     bytes.Buffer
+	capN    int
+	err     error // sticky: first read error or EOF from src
+	closed  bool
+	timeout bool // one-shot: initial prebuffer wait elapsed
 }
 
-func (b *bufReadCloser) Close() error { return b.closer.Close() }
+func newPrefetchReader(src io.ReadCloser, capBytes int) *prefetchReader {
+	pr := &prefetchReader{src: src, capN: capBytes}
+	pr.cond = sync.NewCond(&pr.mu)
+	go pr.fill()
+	return pr
+}
+
+// fill runs in the background, reading from src whenever there is room and
+// waking any blocked reader as data (or a terminal error) arrives.
+func (pr *prefetchReader) fill() {
+	tmp := make([]byte, 32<<10)
+	for {
+		pr.mu.Lock()
+		for pr.buf.Len() >= pr.capN && !pr.closed {
+			pr.cond.Wait()
+		}
+		if pr.closed {
+			pr.mu.Unlock()
+			return
+		}
+		pr.mu.Unlock()
+
+		n, err := pr.src.Read(tmp) // outside the lock so Close can interrupt it
+		pr.mu.Lock()
+		if n > 0 {
+			pr.buf.Write(tmp[:n])
+		}
+		if err != nil {
+			pr.err = err
+			pr.cond.Broadcast()
+			pr.mu.Unlock()
+			return
+		}
+		pr.cond.Broadcast()
+		pr.mu.Unlock()
+	}
+}
+
+func (pr *prefetchReader) Read(p []byte) (int, error) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	for pr.buf.Len() == 0 && pr.err == nil && !pr.closed {
+		pr.cond.Wait()
+	}
+	if pr.buf.Len() == 0 {
+		if pr.closed {
+			return 0, io.EOF
+		}
+		return 0, pr.err
+	}
+	n, _ := pr.buf.Read(p)
+	pr.cond.Broadcast() // room freed for fill
+	return n, nil
+}
+
+// waitReady blocks until at least min bytes are buffered, capping the wait at
+// maxWait so a stalled connection can't freeze the caller (the UI goroutine).
+func (pr *prefetchReader) waitReady(min int, maxWait time.Duration) {
+	timer := time.AfterFunc(maxWait, func() {
+		pr.mu.Lock()
+		pr.timeout = true
+		pr.cond.Broadcast()
+		pr.mu.Unlock()
+	})
+	defer timer.Stop()
+
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	for pr.buf.Len() < min && pr.err == nil && !pr.closed && !pr.timeout {
+		pr.cond.Wait()
+	}
+}
+
+func (pr *prefetchReader) Close() error {
+	pr.mu.Lock()
+	pr.closed = true
+	pr.cond.Broadcast()
+	pr.mu.Unlock()
+	return pr.src.Close()
+}
 
 // Next skips to the following track.
 func (p *Player) Next() {
